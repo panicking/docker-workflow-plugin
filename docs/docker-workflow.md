@@ -266,6 +266,29 @@ For strict egress control on a shared agent, have an administrator initialize
 the host to `deny-all` once (resetting an existing policy if necessary) and
 declare only the domains each pipeline needs.
 
+### Concurrency
+
+`networkPolicy` is a single host-global preset per agent user/daemon. The first
+job on a fresh host initializes it, and concurrent jobs cannot choose different
+base presets. The plugin tolerates the initialization race, but a job that
+requests `deny-all` fails closed if another job initialized a more permissive
+preset. The table under "Network policy" shows the effective result.
+
+`allowedDomains`, `cpus` and `memory` are per sandbox. Each
+`inside(sandbox: …)` uses a unique sandbox name, so parallel jobs on the same
+agent get independent allow rules and resource limits; `sbx rm` removes the
+sandbox-scoped rules. The parallel Maven/npm example above works because both
+branches use the same host preset.
+
+Two jobs can run concurrently only if the agent has enough executors and
+CPU/memory/disk capacity. `cpus` and `memory` limit each sandbox; they do not
+reserve host capacity.
+
+For jobs that genuinely need different base presets, use separate agents or
+hosts and label them accordingly (for example, a `sbx-deny` node initialized
+with `deny-all` and an `sbx-balanced` node initialized with `balanced`). Never
+run `sbx policy reset` from a build.
+
 ### Limitations
 
 * On an already-initialized host, `balanced` and `allow-all` are not verified;
