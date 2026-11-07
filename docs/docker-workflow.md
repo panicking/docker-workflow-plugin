@@ -60,6 +60,180 @@ The above is a complete Pipeline script. `inside` will:
 >
 > When Jenkins can detect that the agent is itself running inside a Docker container, it automatically passes the `--volumes-from` argument to the `inside` container, ensuring that it can share a workspace with the agent.
 
+## Docker Sandboxes
+
+On agents with Docker Sandboxes installed, `inside` can run the build in a
+microVM instead of a plain container by passing a `sandbox:` block:
+
+```groovy
+docker.image('maven:3.9-eclipse-temurin-17').inside(
+    sandbox: [
+        networkPolicy: 'deny-all',
+        allowedDomains: ['repo.maven.apache.org', 'github.com'],
+        cpus: '2',
+        memory: '4g'
+    ]
+) {
+    sh 'mvn clean test'
+}
+```
+
+The image is used as the sandbox template (it must be usable as a template by
+the installed `sbx` release), and the Jenkins workspace plus its `@tmp`
+directory are mounted at the same absolute paths inside the sandbox. `sh` and
+other process-launching steps are wrapped in `sbx exec`.
+
+### Prerequisites
+
+* The `sbx` CLI must be installed on the agent and available on `PATH`
+  (`sbx` is resolved when the step starts; use `withEnv(["PATH+SBX=…"])` if it
+  is installed elsewhere).
+* The agent must be logged in (`sbx login`) and the `sandboxd` daemon reachable.
+* Sandboxes are supported on Unix agents only. On Windows, or when `sbx` is
+  missing, the build fails with an error; it does **not** silently fall back to
+  Docker.
+* Verified with `sbx` v0.51.0 on Linux; older releases may not support every
+  flag used by the step.
+
+### Network policy
+
+`networkPolicy` is one of `allow-all`, `balanced` (the default) or `deny-all`.
+This preset is **host-global** in `sbx`: the plugin initializes it only when the
+host has no policy yet, never resets it, and never changes the preset of an
+already-initialized host. For `deny-all`, the plugin verifies the effective
+policy with `sbx policy check network` and fails closed if it cannot confirm the
+restriction. To change an already-initialized host, an administrator must reset
+its policy out of band (`sbx policy reset`); the plugin never does this.
+
+If the host is already initialized, the host preset wins:
+
+| Requested `networkPolicy` | Fresh host | Already-initialized host |
+|---|---|---|
+| `deny-all` | initialized to `deny-all` | verified; the build fails if egress is not actually denied |
+| `balanced` | initialized to `balanced` | host preset is used; not verified |
+| `allow-all` | initialized to `allow-all` | host preset is used; not verified |
+
+Consequently, an `allow-all` host makes a requested `balanced` block
+effectively `allow-all`. Use `deny-all` when the restriction matters, or have
+an administrator initialize the host to the strictest common preset. On a
+shared agent, keep the requested presets consistent: the first build on a fresh
+host initializes the global preset, and later builds use it.
+
+`allowedDomains` are applied as sandbox-scoped allow rules on top of the preset.
+Each `inside(sandbox: …)` block gets its own sandbox and its own allow rules, so
+parallel builds do not share them. `cpus` and `memory` map to the corresponding
+`sbx create` options.
+
+### Examples
+
+The example above uses `deny-all` with an explicit allow-list. Other common
+shapes:
+
+#### Balanced Node sandbox
+
+```groovy
+node('linux') {
+    docker.image('node:20').inside(sandbox: [networkPolicy: 'balanced']) {
+        sh 'npm ci'
+        sh 'npm test'
+    }
+}
+```
+
+`balanced` is the default, so `sandbox: [:]` is equivalent; listing it makes
+the intent clear.
+
+#### Parallel sandboxes with different allow-lists
+
+```groovy
+node('linux') {
+    parallel(
+        maven: {
+            docker.image('maven:3.9-eclipse-temurin-17').inside(
+                sandbox: [
+                    networkPolicy: 'deny-all',
+                    allowedDomains: ['repo.maven.apache.org', 'repo1.maven.org'],
+                    cpus: '2',
+                    memory: '4g'
+                ]
+            ) {
+                sh 'mvn -B test'
+            }
+        },
+        npm: {
+            docker.image('node:20').inside(
+                sandbox: [
+                    networkPolicy: 'deny-all',
+                    allowedDomains: ['registry.npmjs.org'],
+                    cpus: '2',
+                    memory: '2g'
+                ]
+            ) {
+                sh 'npm ci && npm test'
+            }
+        }
+    )
+}
+```
+
+Both branches share the host-global preset, but each sandbox has its own
+scoped allow-list.
+
+#### Direct step and a custom `sbx` location
+
+```groovy
+node('linux') {
+    withEnv(["PATH+SBX=/opt/sbx/bin"]) {
+        withDockerContainer(
+            image: 'alpine:3.20',
+            sandbox: [
+                networkPolicy: 'deny-all',
+                allowedDomains: ['dl-cdn.alpinelinux.org']
+            ]
+        ) {
+            sh 'apk add --no-cache curl'
+        }
+    }
+}
+```
+
+`args:` cannot be combined with `sandbox:`; the build fails with
+`args: is not supported with sandbox:`.
+
+#### Resource limits only
+
+```groovy
+docker.image('eclipse-temurin:21-jdk').inside(
+    sandbox: [networkPolicy: 'balanced', cpus: '4', memory: '8g']
+) {
+    sh './gradlew --no-daemon build'
+}
+```
+
+For strict egress control on a shared agent, have an administrator initialize
+the host to `deny-all` once (resetting an existing policy if necessary) and
+declare only the domains each pipeline needs.
+
+### Limitations
+
+* On an already-initialized host, `balanced` and `allow-all` are not verified;
+  the host preset is used. Use `deny-all` or have an administrator initialize
+  the host when the exact preset matters.
+* `args:` cannot be combined with `sandbox:`; it has no defined mapping to
+  `sbx create`.
+* Registry credentials configured with `withRegistry` are not forwarded to
+  `sbx`; the agent's Docker/Sandbox credentials must cover the registry.
+* Nested `inside` blocks (a sandbox inside a container or vice versa) are not
+  supported.
+* The step runs `sbx exec` as the agent's `uid:gid` so workspace files keep the
+  agent's ownership. If the sandbox image has no such user, the step fails; the
+  agent and sandbox user must be compatible.
+* Process termination uses `ps` inside the sandbox, so the image must include a
+  `procps`-compatible `ps`, just like the container path.
+* Sandboxes are removed with `sbx rm --force` on success, failure and abort. A
+  Jenkins crash can still orphan a sandbox; cleanup then requires
+  `sbx prune` on the agent.
+
 ## Customize Agent Allocation
 
 All DSL functions which run some Docker command automatically acquire an agent (executor) and a workspace if necessary. For more complex scripts which perform several commands using the DSL, you will typically want to run a block, or the whole script, on the _same_ agent and workspace. In that case just wrap the block in `node`, selecting a label if desired:
