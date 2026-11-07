@@ -122,23 +122,42 @@ class Docker implements Serializable {
         }
 
         public <V> V inside(String args = '', Closure<V> body) {
+            insideImpl(args, null, body)
+        }
+
+        public <V> V inside(Map params, Closure<V> body) {
+            insideImpl(params?.args ? params.args.toString() : '', params?.sandbox, body)
+        }
+
+        private <V> V insideImpl(String args, Object sandbox, Closure<V> body) {
             docker.node {
                 def toRun = imageName()
                 def isUnix = docker.script.isUnix()
-                docker.script.withEnv(["JD_ID=${id}", "JD_TO_RUN=${toRun}"]) {
-                    if (toRun != id && docker.shell(isUnix, [script: 'docker inspect -f . "' + docker.asEnv(isUnix, 'JD_ID') + '"', returnStatus: true]) == 0) {
-                        // Can run it without registry prefix, because it was locally built.
-                        toRun = id
-                    } else {
-                        if (docker.shell(isUnix, [script: 'docker inspect -f . "' + docker.asEnv(isUnix, 'JD_TO_RUN') + '"', returnStatus: true]) != 0) {
-                            // Not yet present locally.
-                            // withDockerContainer requires the image to be available locally, since its start phase is not a durable task.
-                            pull()
+                if (sandbox != null) {
+                    if (args) {
+                        throw new IllegalArgumentException('args: is not supported with sandbox:')
+                    }
+                    // sbx resolves the image itself; do not run the docker
+                    // inspect/pull preflight used by the container path.
+                    docker.script.withDockerContainer(image: toRun, sandbox: sandbox, toolName: docker.script.env.DOCKER_TOOL_NAME) {
+                        body()
+                    }
+                } else {
+                    docker.script.withEnv(["JD_ID=${id}", "JD_TO_RUN=${toRun}"]) {
+                        if (toRun != id && docker.shell(isUnix, [script: 'docker inspect -f . "' + docker.asEnv(isUnix, 'JD_ID') + '"', returnStatus: true]) == 0) {
+                            // Can run it without registry prefix, because it was locally built.
+                            toRun = id
+                        } else {
+                            if (docker.shell(isUnix, [script: 'docker inspect -f . "' + docker.asEnv(isUnix, 'JD_TO_RUN') + '"', returnStatus: true]) != 0) {
+                                // Not yet present locally.
+                                // withDockerContainer requires the image to be available locally, since its start phase is not a durable task.
+                                pull()
+                            }
                         }
                     }
-                }
-                docker.script.withDockerContainer(image: toRun, args: args, toolName: docker.script.env.DOCKER_TOOL_NAME) {
-                    body()
+                    docker.script.withDockerContainer(image: toRun, args: args, toolName: docker.script.env.DOCKER_TOOL_NAME) {
+                        body()
+                    }
                 }
             }
         }
