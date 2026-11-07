@@ -26,10 +26,20 @@ package org.jenkinsci.plugins.docker.workflow;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 
+import com.cloudbees.plugins.credentials.CredentialsProvider;
+import com.cloudbees.plugins.credentials.CredentialsScope;
+import com.cloudbees.plugins.credentials.SecretBytes;
+import com.cloudbees.plugins.credentials.domains.Domain;
+import hudson.model.FileParameterValue;
 import hudson.model.Result;
+import hudson.util.Secret;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.Locale;
+import org.apache.commons.fileupload.FileItem;
+import org.jenkinsci.plugins.plaincredentials.impl.FileCredentialsImpl;
+import org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
@@ -38,6 +48,7 @@ import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 import org.jvnet.hudson.test.BuildWatcher;
 import org.jvnet.hudson.test.JenkinsRule;
 
@@ -51,6 +62,7 @@ public class SbxIntegrationTest {
 
     @ClassRule public static BuildWatcher buildWatcher = new BuildWatcher();
     @Rule public JenkinsRule r = new JenkinsRule();
+    @Rule public TemporaryFolder tmp = new TemporaryFolder();
 
     @BeforeClass
     public static void requireRealSbx() {
@@ -58,6 +70,45 @@ public class SbxIntegrationTest {
         Assume.assumeFalse("POSIX shell required",
                 System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("win"));
         Assume.assumeTrue("sbx must be installed", findSbx() != null);
+    }
+
+    @Test
+    public void credentialsReachSandbox() throws Exception {
+        String sbx = findSbx();
+        Assume.assumeNotNull(sbx);
+        String binDir = new File(sbx).getParent();
+
+        File secretFile = tmp.newFile("sbx-credentials-file");
+        Files.write(secretFile.toPath(), "file-secret-content\n".getBytes(StandardCharsets.UTF_8));
+        FileItem fileItem = new FileParameterValue.FileItemImpl(secretFile);
+        FileCredentialsImpl fileCredential = new FileCredentialsImpl(CredentialsScope.GLOBAL, "sbx-file", "test",
+                fileItem, fileItem.getName(), (SecretBytes) null);
+        StringCredentialsImpl stringCredential = new StringCredentialsImpl(CredentialsScope.GLOBAL, "sbx-string",
+                "test", Secret.fromString("string-secret-value"));
+        CredentialsProvider.lookupStores(r.jenkins).iterator().next()
+                .addCredentials(Domain.global(), fileCredential);
+        CredentialsProvider.lookupStores(r.jenkins).iterator().next()
+                .addCredentials(Domain.global(), stringCredential);
+
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "credentials-sandbox");
+        p.setDefinition(new CpsFlowDefinition(
+                "node {\n"
+                + "  withEnv([\"PATH+SBX=" + binDir + "\"]) {\n"
+                + "    withCredentials([\n"
+                + "        file(credentialsId: 'sbx-file', variable: 'SBX_FILE'),\n"
+                + "        string(credentialsId: 'sbx-string', variable: 'SBX_SECRET')]) {\n"
+                + "      docker.image('alpine:3.20').inside(\n"
+                + "          sandbox: [networkPolicy: 'balanced', cpus: '1', memory: '1g']) {\n"
+                + "        sh 'echo secret=$SBX_SECRET; echo file=$(cat \"$SBX_FILE\")'\n"
+                + "      }\n"
+                + "    }\n"
+                + "  }\n"
+                + "}", true));
+        WorkflowRun b = r.assertBuildStatusSuccess(p.scheduleBuild2(0));
+        r.assertLogContains("secret=****", b);
+        r.assertLogNotContains("string-secret-value", b);
+        r.assertLogContains("file=file-secret-content", b);
+        assertFalse("sandbox leaked: " + sbxLs(), sbxLs().contains("jenkins-"));
     }
 
     @Test
