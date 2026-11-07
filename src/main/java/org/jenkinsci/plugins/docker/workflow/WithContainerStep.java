@@ -45,6 +45,7 @@ import hudson.util.VersionNumber;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -52,8 +53,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.UUID;
 import org.jenkinsci.plugins.docker.commons.tools.DockerTool;
 import org.jenkinsci.plugins.docker.workflow.client.DockerClient;
+import org.jenkinsci.plugins.docker.workflow.client.SbxClient;
 import org.jenkinsci.plugins.docker.workflow.client.WindowsDockerClient;
 import org.jenkinsci.plugins.workflow.steps.AbstractStepDescriptorImpl;
 import org.jenkinsci.plugins.workflow.steps.AbstractStepExecutionImpl;
@@ -80,6 +83,7 @@ public class WithContainerStep extends AbstractStepImpl {
     private final @NonNull String image;
     private String args;
     private String toolName;
+    private @CheckForNull SandboxPolicy sandbox;
 
     @DataBoundConstructor public WithContainerStep(@NonNull String image) {
         this.image = image;
@@ -107,6 +111,15 @@ public class WithContainerStep extends AbstractStepImpl {
         this.toolName = Util.fixEmpty(toolName);
     }
 
+    @CheckForNull
+    public SandboxPolicy getSandbox() {
+        return sandbox;
+    }
+
+    @DataBoundSetter public void setSandbox(@CheckForNull SandboxPolicy sandbox) {
+        this.sandbox = sandbox;
+    }
+
     private static void destroy(String container, @NonNull Launcher launcher, Node node, EnvVars launcherEnv, String toolName) throws Exception {
         new DockerClient(launcher, node, toolName).stop(launcherEnv, container);
     }
@@ -125,6 +138,8 @@ public class WithContainerStep extends AbstractStepImpl {
         @StepContextParameter private transient Run run;
         private String container;
         private String toolName;
+        private boolean sandbox;
+        private String sbxExecutable;
 
         public Execution() {
         }
@@ -142,6 +157,11 @@ public class WithContainerStep extends AbstractStepImpl {
             workspace.mkdirs(); // otherwise it may be owned by root when created for -v
             String ws = getPath(workspace);
             toolName = step.toolName;
+            SandboxPolicy sandboxPolicy = step.sandbox;
+            if (sandboxPolicy != null) {
+                startSandbox(sandboxPolicy, envHost, ws);
+                return false;
+            }
             DockerClient dockerClient = launcher.isUnix()
                 ? new DockerClient(launcher, node, toolName)
                 : new WindowsDockerClient(launcher, node, toolName);
@@ -209,10 +229,81 @@ public class WithContainerStep extends AbstractStepImpl {
 
             ImageAction.add(step.image, run);
             getContext().newBodyInvoker().
-                    withContext(BodyInvoker.mergeLauncherDecorators(getContext().get(LauncherDecorator.class), new Decorator(container, envHost, ws, toolName, dockerVersion))).
-                    withCallback(new Callback(container, toolName)).
+                    withContext(BodyInvoker.mergeLauncherDecorators(getContext().get(LauncherDecorator.class), new Decorator(container, envHost, ws, toolName, dockerVersion, false, null, null))).
+                    withCallback(new Callback(container, toolName, false, null)).
                     start();
             return false;
+        }
+
+        private void startSandbox(SandboxPolicy policy, EnvVars envHost, String ws) throws Exception {
+            if (!launcher.isUnix()) {
+                throw new AbortException("Docker Sandboxes (sbx) are only supported on Unix agents");
+            }
+            policy.validate();
+            if (step.args != null) {
+                throw new AbortException("args: is not supported with sandbox:");
+            }
+
+            String executable = SbxClient.findExecutable(launcher, env);
+            if (executable == null) {
+                throw new AbortException("Docker Sandboxes were requested with sandbox:, but 'sbx' was not found on "
+                        + node.getDisplayName() + ". Install the sbx CLI and log in, or remove sandbox:.");
+            }
+            SbxClient client = new SbxClient(launcher, executable);
+            client.checkVersion(env);
+
+            DockerClient dockerClient = new DockerClient(launcher, node, toolName);
+            Optional<String> containerId = dockerClient.getContainerIdIfContainerized();
+            if (containerId.isPresent()) {
+                listener.getLogger().println("WARNING: " + node.getDisplayName()
+                        + " seems to be running inside container " + containerId.get()
+                        + "; workspace paths may not be visible to sandboxd");
+            }
+
+            FilePath tempDir = tempDir(workspace);
+            tempDir.mkdirs();
+            String tmp = getPath(tempDir);
+
+            String name = "jenkins-" + Util.getDigestOf(
+                    (run != null ? run.getExternalizableId() : "") + ":" + UUID.randomUUID()).substring(0, 20);
+            container = name;
+            sandbox = true;
+            sbxExecutable = executable;
+
+            boolean created = false;
+            try {
+                client.ensureGlobalPolicy(env, policy);
+                client.create(env, name, step.image, policy, Arrays.asList(ws, tmp), tempDir);
+                created = true;
+                client.applySandboxPolicy(env, name, policy);
+            } catch (Exception x) {
+                if (created) {
+                    try {
+                        client.rm(env, name);
+                    } catch (Exception cleanup) {
+                        x.addSuppressed(cleanup);
+                    }
+                }
+                throw x;
+            }
+
+            if (run != null) {
+                ImageAction.add(step.image, run);
+            }
+
+            String whoAmI = null;
+            try {
+                whoAmI = dockerClient.whoAmI();
+            } catch (IOException | InterruptedException x) {
+                listener.getLogger().println("WARNING: could not determine the agent uid:gid; "
+                        + "files created in the workspace may be owned by another user: " + x);
+            }
+
+            getContext().newBodyInvoker().
+                    withContext(BodyInvoker.mergeLauncherDecorators(getContext().get(LauncherDecorator.class),
+                            new Decorator(name, envHost, ws, toolName, null, true, executable, whoAmI))).
+                    withCallback(new Callback(name, toolName, true, executable)).
+                    start();
         }
 
         private String getPath(FilePath filePath)
@@ -232,7 +323,19 @@ public class WithContainerStep extends AbstractStepImpl {
         @Override public void stop(@NonNull Throwable cause) throws Exception {
             if (container != null) {
                 LOGGER.log(Level.FINE, "stopping container " + container, cause);
-                destroy(container, launcher, getContext().get(Node.class), env, toolName);
+                if (sandbox) {
+                    if (sbxExecutable == null) {
+                        LOGGER.log(Level.WARNING, "Cannot remove sandbox {0}: sbx executable is unknown", container);
+                        return;
+                    }
+                    try {
+                        new SbxClient(launcher, sbxExecutable).rm(env == null ? new EnvVars() : env, container);
+                    } catch (Exception x) {
+                        LOGGER.log(Level.WARNING, "Failed to remove sandbox " + container, x);
+                    }
+                } else {
+                    destroy(container, launcher, getContext().get(Node.class), env, toolName);
+                }
             }
         }
 
@@ -247,14 +350,21 @@ public class WithContainerStep extends AbstractStepImpl {
         private final @CheckForNull String toolName;
         private final boolean hasEnv;
         private final boolean hasWorkdir;
+        private final boolean sandbox;
+        private final @CheckForNull String sbxExecutable;
+        private final @CheckForNull String whoAmI;
 
-        Decorator(String container, EnvVars envHost, String ws, @CheckForNull String toolName, VersionNumber dockerVersion) {
+        Decorator(String container, EnvVars envHost, String ws, @CheckForNull String toolName, VersionNumber dockerVersion,
+                  boolean sandbox, @CheckForNull String sbxExecutable, @CheckForNull String whoAmI) {
             this.container = container;
             this.envHost = Util.mapToEnv(envHost);
             this.ws = ws;
             this.toolName = toolName;
             this.hasEnv = dockerVersion != null && dockerVersion.compareTo(new VersionNumber("1.13.0")) >= 0;
             this.hasWorkdir = dockerVersion != null && dockerVersion.compareTo(new VersionNumber("17.12")) >= 0;
+            this.sandbox = sandbox;
+            this.sbxExecutable = sbxExecutable;
+            this.whoAmI = whoAmI;
         }
 
         @NonNull
@@ -267,14 +377,22 @@ public class WithContainerStep extends AbstractStepImpl {
                     } catch (InterruptedException x) {
                         throw new IOException(x);
                     }
-                    List<String> prefix = new ArrayList<>(Arrays.asList(executable, "exec"));
-                    List<Boolean> masksPrefixList = new ArrayList<>(Arrays.asList(false, false));
+                    List<String> prefix = new ArrayList<>(sandbox
+                            ? Arrays.asList(executable, "exec", "-i")
+                            : Arrays.asList(executable, "exec"));
+                    List<Boolean> masksPrefixList = new ArrayList<>(Collections.nCopies(prefix.size(), false));
+                    if (sandbox && whoAmI != null && !whoAmI.isEmpty()) {
+                        prefix.add("-u");
+                        masksPrefixList.add(false);
+                        prefix.add(whoAmI);
+                        masksPrefixList.add(false);
+                    }
                     if (ws != null) {
                         FilePath cwd = starter.pwd();
                         if (cwd != null) {
                             String path = cwd.getRemote();
                             if (!path.equals(ws)) {
-                                if (hasWorkdir) {
+                                if (sandbox || hasWorkdir) {
                                     prefix.add("--workdir");
                                     masksPrefixList.add(false);
                                     if (super.isUnix()) {
@@ -302,9 +420,9 @@ public class WithContainerStep extends AbstractStepImpl {
                         }
                     }
                     LOGGER.log(Level.FINE, "(exec) reduced environment: {0}", envReduced);
-                    if (hasEnv) {
+                    if (sandbox || hasEnv) {
                         for (String e : envReduced) {
-                            prefix.add("--env");
+                            prefix.add(sandbox ? "-e" : "--env");
                             masksPrefixList.add(false);
                             if (super.isUnix()) {
                                 prefix.add(e);
@@ -366,6 +484,15 @@ public class WithContainerStep extends AbstractStepImpl {
                 @Override public void kill(Map<String,String> modelEnvVars) throws IOException, InterruptedException {
                     ByteArrayOutputStream baos = new ByteArrayOutputStream();
                     String executable = getExecutable();
+                    List<String> execPrefix = new ArrayList<>(Arrays.asList(executable, "exec"));
+                    if (sandbox) {
+                        execPrefix.add("-i");
+                        if (whoAmI != null && !whoAmI.isEmpty()) {
+                            execPrefix.add("-u");
+                            execPrefix.add(whoAmI);
+                        }
+                    }
+                    execPrefix.add(container);
                     // For this code to be able to successfully kill processes:
                     // 1: The image must contain `ps`, which notably excludes slim variants of Debian.
                     // 2. The version of `ps` being used must support `-o command`. Busybox does not (so no Alpine!).
@@ -375,7 +502,9 @@ public class WithContainerStep extends AbstractStepImpl {
                     //    `JENKINS_SERVER_COOKIE=$jsc`, but the output must include `JENKINS_SERVER_COOKIE=<cookie here>
                     //    for this code to work.
                     // In practice, this means that this code only works with images that include procps.
-                    if (getInner().launch().cmds(executable, "exec", container, "ps", "-A", "-o", "pid,command", "e").stdout(baos).quiet(true).start().joinWithTimeout(DockerClient.CLIENT_TIMEOUT, TimeUnit.SECONDS, listener) != 0) {
+                    List<String> psCmds = new ArrayList<>(execPrefix);
+                    psCmds.addAll(Arrays.asList("ps", "-A", "-o", "pid,command", "e"));
+                    if (getInner().launch().cmds(psCmds).stdout(baos).quiet(true).start().joinWithTimeout(DockerClient.CLIENT_TIMEOUT, TimeUnit.SECONDS, listener) != 0) {
                         throw new IOException("failed to run ps");
                     }
                     List<String> pids = new ArrayList<String>();
@@ -395,7 +524,8 @@ public class WithContainerStep extends AbstractStepImpl {
                     }
                     LOGGER.log(Level.FINE, "killing {0}", pids);
                     if (!pids.isEmpty()) {
-                        List<String> cmds = new ArrayList<>(Arrays.asList(executable, "exec", container, "kill"));
+                        List<String> cmds = new ArrayList<>(execPrefix);
+                        cmds.add("kill");
                         cmds.addAll(pids);
                         if (getInner().launch().cmds(cmds).quiet(true).start().joinWithTimeout(DockerClient.CLIENT_TIMEOUT, TimeUnit.SECONDS, listener) != 0) {
                             throw new IOException("failed to run kill");
@@ -403,6 +533,12 @@ public class WithContainerStep extends AbstractStepImpl {
                     }
                 }
                 private String getExecutable() throws IOException, InterruptedException {
+                    if (sandbox) {
+                        if (sbxExecutable == null) {
+                            throw new IOException("sbx executable is not configured");
+                        }
+                        return sbxExecutable;
+                    }
                     EnvVars env = new EnvVars();
                     for (String pair : envHost) {
                         env.addLine(pair);
@@ -419,16 +555,33 @@ public class WithContainerStep extends AbstractStepImpl {
         private static final long serialVersionUID = 1;
         private final String container;
         private final String toolName;
+        private final boolean sandbox;
+        private final @CheckForNull String sbxExecutable;
 
-        Callback(String container, String toolName) {
+        Callback(String container, String toolName, boolean sandbox, @CheckForNull String sbxExecutable) {
             this.container = container;
             this.toolName = toolName;
+            this.sandbox = sandbox;
+            this.sbxExecutable = sbxExecutable;
         }
 
         @Override protected void finished(StepContext context) throws Exception {
             Launcher launcher = context.get(Launcher.class);
             if (launcher != null) {
-                destroy(container, launcher, context.get(Node.class), context.get(EnvVars.class), toolName);
+                if (sandbox) {
+                    if (sbxExecutable == null) {
+                        LOGGER.log(Level.WARNING, "Cannot remove sandbox {0}: sbx executable is unknown", container);
+                        return;
+                    }
+                    EnvVars env = context.get(EnvVars.class);
+                    try {
+                        new SbxClient(launcher, sbxExecutable).rm(env == null ? new EnvVars() : env, container);
+                    } catch (Exception x) {
+                        LOGGER.log(Level.WARNING, "Failed to remove sandbox " + container, x);
+                    }
+                } else {
+                    destroy(container, launcher, context.get(Node.class), context.get(EnvVars.class), toolName);
+                }
             }
         }
 

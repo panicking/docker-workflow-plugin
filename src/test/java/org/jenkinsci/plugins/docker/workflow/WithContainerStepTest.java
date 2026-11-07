@@ -38,6 +38,7 @@ import hudson.util.ArgumentListBuilder;
 import hudson.util.Secret;
 import hudson.util.StreamTaskListener;
 import java.io.File;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.logging.Level;
@@ -59,6 +60,7 @@ import org.jenkinsci.plugins.docker.workflow.client.DockerClient;
 import org.jenkinsci.plugins.durabletask.BourneShellScript;
 import org.jenkinsci.plugins.plaincredentials.impl.FileCredentialsImpl;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
+import org.jenkinsci.plugins.workflow.cps.SnippetizerTester;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
 import org.jenkinsci.plugins.workflow.steps.Step;
@@ -96,10 +98,24 @@ public class WithContainerStepTest {
             @Override public void evaluate() throws Throwable {
                 WithContainerStep s1 = new WithContainerStep("java");
                 s1.setArgs("--link db:db");
+                SandboxPolicy sandbox = new SandboxPolicy();
+                sandbox.setNetworkPolicy(SandboxPolicy.DENY_ALL);
+                sandbox.setAllowedDomains(Arrays.asList("repo.maven.apache.org", "github.com"));
+                sandbox.setCpus("2");
+                sandbox.setMemory("4g");
+                s1.setSandbox(sandbox);
                 story.j.assertEqualDataBoundBeans(s1, new StepConfigTester(story.j).configRoundTrip(s1));
                 story.j.jenkins.getDescriptorByType(DockerTool.DescriptorImpl.class).setInstallations(new DockerTool("docker15", "/usr/local/docker15", Collections.<ToolProperty<?>>emptyList()));
                 s1.setToolName("docker15");
                 story.j.assertEqualDataBoundBeans(s1, new StepConfigTester(story.j).configRoundTrip(s1));
+
+                WithContainerStep s2 = new WithContainerStep("java");
+                SandboxPolicy sandbox2 = new SandboxPolicy();
+                sandbox2.setNetworkPolicy(SandboxPolicy.DENY_ALL);
+                sandbox2.setAllowedDomains(Arrays.asList("repo.maven.apache.org"));
+                s2.setSandbox(sandbox2);
+                new SnippetizerTester(story.j).assertRoundTrip(s2,
+                        "withDockerContainer(image: 'java', sandbox: [allowedDomains: ['repo.maven.apache.org'], networkPolicy: 'deny-all']) {\n    // some block\n}");
             }
         });
     }

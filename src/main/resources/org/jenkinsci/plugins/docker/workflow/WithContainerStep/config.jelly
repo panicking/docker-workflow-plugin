@@ -30,5 +30,6 @@ THE SOFTWARE.
     <f:entry field="args" title="Additional arguments">
         <f:textbox/>
     </f:entry>
+    <f:property field="sandbox"/>
     <d:selectDockerTool field="toolName" xmlns:d="/lib/docker/commons"/>
 </j:jelly>

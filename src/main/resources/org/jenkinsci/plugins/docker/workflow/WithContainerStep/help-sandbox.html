@@ -1,0 +1,10 @@
+<div>
+    Run the nested steps inside a Docker Sandbox (<code>sbx</code>) instead of a
+    plain container. When set, the image is used as the sandbox template and
+    the workspace is mounted at the same path inside the sandbox.
+    <p>
+        The agent must have <code>sbx</code> installed and logged in. Sandbox
+        support is Unix-only; if <code>sbx</code> is unavailable the build fails
+        rather than falling back to Docker.
+    </p>
+</div>
