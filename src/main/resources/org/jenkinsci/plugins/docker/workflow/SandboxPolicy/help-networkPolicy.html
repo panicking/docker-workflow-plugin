@@ -1,0 +1,10 @@
+<div>
+    Base network egress policy for the sandbox.
+    <code>balanced</code> permits common development traffic; <code>deny-all</code>
+    blocks all egress except the domains listed in
+    <code>allowedDomains</code>; <code>allow-all</code> permits everything.
+    <p>
+        This preset is host-global in <code>sbx</code>. The plugin initializes it
+        only when the agent has no policy yet and never resets an existing one.
+    </p>
+</div>
