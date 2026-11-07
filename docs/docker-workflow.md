@@ -94,6 +94,9 @@ other process-launching steps are wrapped in `sbx exec`.
   Docker.
 * Verified with `sbx` v0.51.0 on Linux; older releases may not support every
   flag used by the step.
+* For a complete Debian/Ubuntu agent provisioning guide (installation, KVM,
+  daemon service, login, policy and Jenkins setup), see
+  [Provisioning a Debian/Ubuntu Jenkins agent](sandbox-agent-provisioning.md).
 
 ### Network policy
 
