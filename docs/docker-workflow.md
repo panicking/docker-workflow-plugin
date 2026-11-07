@@ -124,6 +124,55 @@ Each `inside(sandbox: …)` block gets its own sandbox and its own allow rules, 
 parallel builds do not share them. `cpus` and `memory` map to the corresponding
 `sbx create` options.
 
+### Credentials
+
+Credentials are not baked into the sandbox. Environment credentials from
+`withCredentials` (string, username/password, secret text) and `withEnv` are
+passed to every process launched through the sandbox as
+`sbx exec -e KEY=VALUE`, with the values masked in the console. They are
+applied per exec, not at `sbx create` time. The agent's own environment is
+filtered out; only build-scoped variables are passed.
+
+File credentials (`file`, `sshUserPrivateKey`) are written by Jenkins on the
+agent under the workspace's `@tmp` directory and exposed as an environment
+variable containing the path. `@tmp` is mounted at the same absolute path in
+the sandbox, and `sbx exec` runs as the agent's `uid:gid`, so the file is
+readable inside. `configFileProvider` files work the same way.
+
+```groovy
+withCredentials([
+    file(credentialsId: 'maven-settings', variable: 'MAVEN_SETTINGS'),
+    string(credentialsId: 'repo-token', variable: 'REPO_TOKEN')
+]) {
+    docker.image('maven:3.9-eclipse-temurin-17').inside(
+        sandbox: [
+            networkPolicy: 'deny-all',
+            allowedDomains: ['repo.maven.apache.org', 'repo1.maven.org']
+        ]
+    ) {
+        sh 'mvn -B -s "$MAVEN_SETTINGS" clean verify'
+    }
+}
+```
+
+Steps which do not launch a process through the `Launcher` — for example the
+`git` and `checkout` steps, `withCredentials` itself, `junit` or
+`archiveArtifacts` — run on the agent, not inside the sandbox. They use Jenkins
+credentials normally and share the workspace with the sandbox. An SSH agent
+socket created on the host is not mounted into the sandbox; use a key file or
+configure SSH inside the sandbox.
+
+Docker registry credentials configured with `withRegistry` are **not**
+forwarded to `sbx`. Private template images require the agent to be
+authenticated with `sbx`/Docker, or a sandbox kit/template with credentials.
+`sbx secret` and kit credentials are not mapped from Jenkins credentials.
+
+> **NOTE:**
+> A secret passed with `-e` appears in the `sbx exec` command line, just as it
+> does with `docker exec --env`. Jenkins masks the build console, but a local
+> process inspection may still reveal it, and the sandbox workload can read it.
+> Fine logging of the reduced exec environment can also expose values.
+
 ### Examples
 
 The example above uses `deny-all` with an explicit allow-list. Other common
